@@ -1,0 +1,44 @@
+{
+    "easymore_output": "/path/to/forcings/easymore-outputs",
+    "output_path": "/path/to/output/hypemodel",
+    "timeshift": -6,
+    "forcing_units": {
+        "temperature": {
+            "in_varname": "CaSR_v3.1_P_TT_09975",
+            "in_units": "celsius",
+            "out_units": "celsius"
+        },
+        "precipitation": {
+            "in_varname": "CaSR_v3.1_A_PR0_SFC",
+            "in_units": "m/hr",
+            "out_units": "mm/day"
+        }
+    },
+    "geofabric_mapping": {
+        "basinID": {
+            "in_varname": "COMID"
+        },
+        "nextDownID": {
+            "in_varname": "NextDownID"
+        },
+        "area": {
+            "in_varname": "unitarea",
+            "in_units": "km^2",
+            "out_units": "m^2"
+        },
+        "rivlen": {
+            "in_varname": "new_len_km",
+            "in_units": "km",
+            "out_units": "m"
+        }
+    },
+    "gistool_outputs": {
+        "soil": "/path/to/attributes/soil/CAN_01AK006_stats_soil_classes.csv",
+        "landcover": "/path/to/attributes/landcover/MCD12Q1.061/CAN_01AK006_stats_MCD12Q1.061_2020.csv",
+        "elevation": "/path/to/attributes/elevation/CAN_01AK006_stats_elv.csv"
+    },
+    "subbasins_shapefile": "/path/to/shapefiles/CAN_01AK006_distributed_basin.shp",
+    "rivers_shapefile": "/path/to/shapefiles/CAN_01AK006_distributed_river.shp",
+    "frac_threshold": 0.01,
+    "spinup_days": 274
+}

@@ -36,204 +36,88 @@ def sort_geodata(geodata):
     geodata = geodata.sort_values(by='n_ds_subbasins', ascending=False, ignore_index=True)
     geodata = geodata.drop(columns=['n_ds_subbasins'])
     return geodata
-#---------------------------------------------------------------
-#---------------------------------------------------------------
+
 
 # write HYPE forcing from easymore nc files
 def write_hype_forcing(easymore_output, timeshift, forcing_units, geofabric_mapping, path_to_save):
-    if not os.path.isdir(path_to_save):
+    """Initialize forcing files."""
+    # check if path_to_save exists and if not create it
+    if not os.path.exists(path_to_save):
         os.makedirs(path_to_save)
-    # function to get daily values from hourly timeseries
-    def convert_hourly_to_daily (input_file_name,
-                                 variable_in,
-                                 variable_out,
-                                 variable_out_long_name = None,
-                                 var_unit_conversion = None,
-                                 var_time = 'time',
-                                 var_id = 'id',
-                                 time_diff = 0,
-                                 stat = 'max', 
-                                 output_file_name_nc = None,
-                                 output_file_name_txt = None,
-                                 Fill_value = -9999.0): # 'max', 'min', 'mean'
+    # initalize pint registry
+    _ureg = pint.UnitRegistry(force_ndarray_like=True)
 
-        # read the input houtly nc file
-        ds = xr.open_dataset(input_file_name)
-        # set id as integer
-        ds.coords[var_id] = ds.coords[var_id].astype(int)
+    # read a list of netcdf files
+    easymore_output_list = sorted(glob.glob(os.path.join(easymore_output, '*.nc*')))
 
-        # drop all the other variables except the mentioned varibale, time and id
-        variables_to_keep = [variable_in, var_time]
-        if not var_id is None:
-            variables_to_keep.append(var_id)
+    # read the forcing files using xarray and create a self.forcing
+    datasets = [xr.open_dataset(p) for p in easymore_output_list]
+    ds = xr.concat(datasets, 'time')
 
-        # Drop all variables except the specified ones
-        ds = ds.drop([v for v in ds.variables if v not in variables_to_keep])
+    # adjust the model time zone
+    ds = ds.assign_coords({
+            'time': ds.time.to_index().tz_localize('UTC').tz_convert('America/Edmonton').tz_localize(None)
+        })
 
-        # roll the time based on hour of difference to have more accurate
-        if time_diff !=0:
-            ds[var_time] = ds[var_time].roll(time=time_diff)
-            # Remove the first or last roll_steps time steps
-            if time_diff < 0:
-                ds = ds.isel(time=slice( None, time_diff))
-            elif time_diff > 0:
-                ds = ds.isel(time=slice( time_diff, None))
+    # rename the self.forcing variables to match the forcing_vars
+    # and assign pint units to the self.forcing variables
+    rename_vars_dict = {}
+    for key, value_dict in forcing_units.items():
+        rename_vars_dict[value_dict['in_varname']] = key
+    ds = ds.rename(rename_vars_dict)
 
-        # to create the xarray dataframe with daily time
-        if stat == 'max':
-            ds_daily = ds.resample(time='D').max()
-        elif stat == 'min':
-            ds_daily = ds.resample(time='D').min()
-        elif stat == 'mean':
-            ds_daily = ds.resample(time='D').mean()
-        elif stat == 'sum':
-            ds_daily = ds.resample(time='D').sum()
-        else:
-            sys.exit('input stat should be max, min, mean or sum')
+    # drop the variable not in self.forcing_vars
+    ds = ds[['temperature', 'precipitation']]
 
-        # conversion of units based on provided conversion unit
-        ds_daily[variable_in] = ds_daily[variable_in].pint.quantify(var_unit_conversion['in_unit'])
-        ds_daily[variable_in] = ds_daily[variable_in].pint.to(var_unit_conversion['out_unit'])
-        ds_daily = ds_daily.pint.dequantify()
+    # assign pint units to the self.forcing variables
+    renamed_forcing_units = {}
+    for key, value_dict in forcing_units.items():
+        renamed_forcing_units[key] = value_dict['in_units']
+    ds = ds.pint.quantify(units=renamed_forcing_units, unit_registry=_ureg)
 
-        # drop the vairiable in
-        ds_daily = ds_daily.rename({variable_in: variable_out})
+    # convert the self.forcing units to the default forcing units
+    renamed_to_forcing_units = {}
+    for key, value_dict in forcing_units.items():
+        renamed_to_forcing_units[key] = value_dict['out_units']
+    ds = ds.pint.to(units=renamed_to_forcing_units)
 
-        # add long name
-        if not variable_out_long_name is None:
-            ds_daily[variable_out].attrs['long_name'] = variable_out_long_name
+    # after unit conversion, dequantify the self.forcing
+    ds = ds.pint.dequantify()
 
-        # transpose the variable
-        ds_daily[variable_out] = ds_daily[variable_out].transpose()
+    # print Tobs.txt, TMINobs.txt, TMAXobs.txt, and Pobs.txt files
+    # first Pobs.txt
+    pobs_file = os.path.join(path_to_save, 'Pobs.txt')
+    pobs = ds['precipitation'].resample(time='1D').mean().to_dataframe()
+    pobs_unstacked = pobs['precipitation'].unstack(level='COMID')
+    pobs_unstacked.columns = [str(int(col)) for col in pobs_unstacked.columns]
+    pobs_unstacked.to_csv(pobs_file, float_format="%.3f", sep='\t')
 
-        # this section is written to avoid issues with netcdf and HYPE!
-        # I could not find what is the issue, however, when the data is 
-        # transferred to df, tranfer back to xarray and saved, the issue
-        # with HYPE is resolved. this need closer look. Also HYPE netcdf
-        # is in its initial stage of developement and can have issue as
-        # well
-        df = ds_daily[variable_out].to_dataframe()
-        df = df.unstack()
-        df = df.T
-        df = df.droplevel(level=0, axis=0)
-        df.columns.name = None
-        df.index.name = var_time
-        if not output_file_name_txt is None:
-            df.to_csv(output_file_name_txt,\
-                      sep='\t', na_rep='', index_label='time', float_format='%.3f')
-        esmr = Easymore()
-        ds_daily = esmr.dataframe_to_netcdf_xr(df,
-                                         data_frame_DateTime_column = var_time,
-                                         variable_name = variable_out,
-                                         variable_dim_name = 'id',
-                                         unit_of_variable = var_unit_conversion['out_unit'],
-                                         variable_long_name = variable_out_long_name,
-                                         Fill_value = Fill_value)
+    # Tobs.txt
+    tobs_file = os.path.join(path_to_save, 'Tobs.txt')
+    tobs = ds['temperature'].resample(time='1D').mean().to_dataframe()
+    tobs_unstacked = tobs['temperature'].unstack(level='COMID')
+    tobs_unstacked.columns = [str(int(col)) for col in tobs_unstacked.columns]
+    tobs_unstacked.to_csv(tobs_file, float_format="%.3f", sep='\t')
 
-        # save the file if path is provided
-        if not output_file_name_nc is None:
-            if os.path.isfile(output_file_name_nc):
-                os.remove(output_file_name_nc)
-            ds_daily.to_netcdf(output_file_name_nc,\
-                               encoding = {variable_out:{'_FillValue':Fill_value}})
+    # TMAXobs.txt
+    tmaxobs_file = os.path.join(path_to_save, 'TMAXobs.txt')
+    tmaxobs = ds['temperature'].resample(time='1D').max().to_dataframe()
+    tmaxobs_unstacked = tmaxobs['temperature'].unstack(level='COMID')
+    tmaxobs_unstacked.columns = [str(int(col)) for col in tmaxobs_unstacked.columns]
+    tmaxobs_unstacked.to_csv(tmaxobs_file, float_format="%.3f", sep='\t')
 
-        # return
-        return ds_daily
-    ############
-    print('Merging easymore outputs to one NetCDF file \n')
-    # Replace with your file path pattern
-    easymore_nc_files = sorted(glob.glob(easymore_output+'/*.nc'))
-    # split the files in batches as cdo cannot mergetime long list of file names
-    batch_size = 20
-    # avoid splitting files if their number is too small
-    if(len(easymore_nc_files) < batch_size):
-        batch_size = len(easymore_nc_files)
-    files_split = np.array_split(easymore_nc_files,batch_size)
-    cdo_obj = cdo.Cdo()  # CDO object
-    intermediate_files = []
+    # TMINobs.txt
+    tminobs_file = os.path.join(path_to_save, 'TMINobs.txt')
+    tminobs = ds['temperature'].resample(time='1D').min().to_dataframe()
+    tminobs_unstacked = tminobs['temperature'].unstack(level='COMID')
+    tminobs_unstacked.columns = [str(int(col)) for col in tminobs_unstacked.columns]
+    tminobs_unstacked.to_csv(tminobs_file, float_format="%.3f", sep='\t')
 
-    # split files into intermediate files
-    # Combine in batches
-    with alive_bar(batch_size, force_tty=True) as bar:
-        for i in range(batch_size):
-            # print(f'Processing easymore outputs: batch no {i+1} out of {batch_size} \n')
-            batch_files = files_split[i].tolist()
-            batch_output = f'forcing_batch_{i}.nc'
-            cdo_obj.mergetime(input=batch_files, output=batch_output)
-            intermediate_files.append(batch_output)
-            bar()
+    return
 
-    # Combine intermediate results into one netcdf file
-    cdo_obj.mergetime(input=intermediate_files, output='merged_forcing.nc')
-
-    # Clean up intermediate files if needed
-    for f in intermediate_files:
-        os.remove(f)
-
-    # open the forcing file
-    forcing = xr.open_dataset('merged_forcing.nc')
-    # convert calendar to 'standard'
-    forcing = forcing.convert_calendar('standard')
-    # The data are in UTC time and they need to be shifted by "timeshift" to local time
-    forcing['time'] = forcing['time'] + pd.Timedelta(hours=timeshift)
-    # write to netcdf
-    forcing.to_netcdf('merged_forcing.nc')
-    forcing.close()
-    ############
-    print('Get average daily values for HYPE \n')
-    basinID = geofabric_mapping['basinID']['in_varname']
-    ds1= convert_hourly_to_daily('merged_forcing.nc',
-                                forcing_units['temperature']['in_varname'],
-                                'TMAXobs',
-                                var_unit_conversion = {'in_unit':forcing_units['temperature']['in_units'],'out_unit':forcing_units['temperature']['out_units']},
-                                var_time = 'time',
-                                var_id = basinID,
-                                time_diff = -7,
-                                stat = 'max',
-                                # output_file_name_nc = path_to_save+'TMAXobs.nc',
-                                output_file_name_txt = path_to_save+'TMAXobs.txt')
-
-    ds2= convert_hourly_to_daily('merged_forcing.nc',
-                                forcing_units['temperature']['in_varname'],
-                                'TMINobs',
-                                var_unit_conversion = {'in_unit':forcing_units['temperature']['in_units'],'out_unit':forcing_units['temperature']['out_units']},
-                                var_time = 'time',
-                                var_id = basinID,
-                                time_diff = -7,
-                                stat = 'min',
-                                # output_file_name_nc = path_to_save+'TMINobs.nc',
-                                output_file_name_txt = path_to_save+'TMINobs.txt')
-
-    ds3= convert_hourly_to_daily('merged_forcing.nc',
-                                forcing_units['temperature']['in_varname'],
-                                'Tobs',
-                                var_unit_conversion = {'in_unit':forcing_units['temperature']['in_units'],'out_unit':forcing_units['temperature']['out_units']},
-                                var_time = 'time',
-                                var_id = basinID,
-                                time_diff = -7,
-                                stat = 'mean',
-                                # output_file_name_nc = path_to_save+'Tobs.nc',
-                                output_file_name_txt = path_to_save+'Tobs.txt')
-
-    ds4= convert_hourly_to_daily('merged_forcing.nc',
-                                forcing_units['precipitation']['in_varname'],
-                                'Pobs',
-                                var_unit_conversion = {'in_unit':forcing_units['precipitation']['in_units'],'out_unit':forcing_units['precipitation']['out_units']},
-                                var_time = 'time',
-                                var_id = basinID,
-                                time_diff = -7,
-                                stat = 'mean',
-                                # output_file_name_nc = path_to_save+'Pobs.nc',
-                                output_file_name_txt = path_to_save+'Pobs.txt')
-    
-    # remove the merged netcdf file
-    os.remove('merged_forcing.nc')
-
-#---------------------------------------------------------------
-#---------------------------------------------------------------
 
 # write GeoData and GeoClass files
-def write_hype_geo_files(gistool_output, subbasins_shapefile, rivers_shapefile, frac_threshold, geofabric_mapping, path_to_save):
+def write_hype_geo_files(gistool_outputs, subbasins_shapefile, rivers_shapefile, frac_threshold, geofabric_mapping, path_to_save):
     
     if not os.path.isdir(path_to_save):
         os.makedirs(path_to_save)
@@ -243,9 +127,9 @@ def write_hype_geo_files(gistool_output, subbasins_shapefile, rivers_shapefile, 
     NextDownID = geofabric_mapping['nextDownID']['in_varname']
 
     # load the information from the gistool for soil and land cover and find the number of geoclass
-    soil_type = pd.read_csv(gistool_output+'modified_domain_stats_soil_classes.csv')
-    landcover_type = pd.read_csv(gistool_output+'modified_domain_stats_NA_NALCMS_landcover_2020_30m.csv')
-    elevation_mean = pd.read_csv(gistool_output+'modified_domain_stats_elv.csv')
+    soil_type = pd.read_csv(gistool_outputs['soil'])
+    landcover_type = pd.read_csv(gistool_outputs['landcover'])
+    elevation_mean = pd.read_csv(gistool_outputs['elevation'])
 
     soil_type = soil_type.sort_values(by=basinID).reset_index(drop=True)
     landcover_type = landcover_type.sort_values(by=basinID).reset_index(drop=True)
@@ -452,7 +336,7 @@ def write_hype_geo_files(gistool_output, subbasins_shapefile, rivers_shapefile, 
     ]
 
     # Open the file in write mode
-    with open(path_to_save+'GeoClass.txt', 'w') as file:
+    with open(os.path.join(path_to_save, 'GeoClass.txt'), 'w') as file:
         # Write the commented lines
         for line in commented_lines:
             file.write(line + '\n')
@@ -477,7 +361,7 @@ def write_hype_geo_files(gistool_output, subbasins_shapefile, rivers_shapefile, 
 
 
     # writing the `GeoClass.txt` file
-    with open(path_to_save+'GeoClass.txt', 'a') as file:
+    with open(os.path.join(path_to_save, 'GeoClass.txt'), 'a') as file:
             file.write("""! ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------	
 !          SLC	LULC	SOIL TYPE	Main crop cropid	Second crop cropid	Crop rotation group	Vegetation type	Special class code	Tile depth	Stream depth	Number of soil layers	Soil layer depth 1	Soil layer depth 2	Soil layer depth 3 \n""")
             combination.to_csv(file, sep='\t', index=False, header=False)
@@ -488,7 +372,7 @@ def write_hype_geo_files(gistool_output, subbasins_shapefile, rivers_shapefile, 
 # write par.txt file
 def write_hype_par_file(path_to_save):
 
-    output_file = path_to_save+'par.txt'
+    output_file = os.path.join(path_to_save, 'par.txt')
 
     if os.path.isfile(output_file):
         os.remove(output_file)
@@ -590,7 +474,7 @@ qmean 	200	!! initial value for calculation of mean flow (mm/yr) - can also be g
 # write info and filedir files
 def write_hype_info_filedir_files(path_to_save, spinup_days):
     # write filedir file
-    output_file = path_to_save+'filedir.txt'
+    output_file = os.path.join(path_to_save, 'filedir.txt')
 
     if os.path.isfile(output_file):
         os.remove(output_file)
@@ -598,15 +482,15 @@ def write_hype_info_filedir_files(path_to_save, spinup_days):
     with open(output_file, 'w') as file:
             file.write('./')
     # create results directory
-    
-    if not os.path.isdir(path_to_save+'/results'):
-        os.makedirs(path_to_save+'/results')
-        
+
+    if not os.path.isdir(os.path.join(path_to_save, 'results')):
+        os.makedirs(os.path.join(path_to_save, 'results'))
+
     ###########
 
     # Output par to a .txt file
 
-    output_file = path_to_save+'info.txt'
+    output_file = os.path.join(path_to_save, 'info.txt')
     if os.path.isfile(output_file):
         os.remove(output_file)
 
@@ -614,7 +498,7 @@ def write_hype_info_filedir_files(path_to_save, spinup_days):
     # define start time, end time, based on input forcing
     # spinup period is a user defined inputs
 
-    Pobs = pd.read_csv(path_to_save+'Pobs.txt', sep='\t', parse_dates=['time'])
+    Pobs = pd.read_csv(os.path.join(path_to_save, 'Pobs.txt'), sep='\t', parse_dates=['time'])
     Pobs['time'] = Pobs['time'].dt.date
     start_date = Pobs['time'].iloc[0]
     end_date = Pobs['time'].iloc[-1]
@@ -657,8 +541,8 @@ indatachecklevel	2
             file.write(line + '\n')
 
     # create df2
-    df2_row=['bdate','cdate','edate','resultdir','instate', 'warning']
-    df2_val=[start_date,spinup_date,end_date,'./results/', 'n','y']
+    df2_row=['bdate', 'cdate', 'edate', 'resultdir', 'instate', 'warning']
+    df2_val=[start_date, spinup_date, end_date, './results/', 'n', 'y']
     df2=pd.DataFrame(df2_val, index=df2_row, columns=None)
 
     # append df2
